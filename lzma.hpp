@@ -2,140 +2,178 @@
 #define __BEE_LZMA__
 #include <cstdint>
 #include <cstddef>
+#include <algorithm>
 
-namespace Beecode {
+namespace BeeCode {
 
 bool LZMADecodeStream(uint8_t* in, std::size_t inSize, std::size_t* out, uint8_t& outSize);
 
 #ifdef LZMA_IMPLEMENTATION
 
-std::size_t bNumBitModelTotalBits { 11 };
-std::size_t bNumMoveBits { 5 };
+template<typename T>
+T swap(T v){
+    T value = v;
+    T swapped = 0;
+    for(std::size_t i = 0; i < sizeof(v); i++){ swapped = (v & 0xFF) | swapped << 8; v >>= 8; } 
+    return swapped;
+}
 
+template<uint32_t numBits, uint32_t size>
 struct ProbTable {
-    std::size_t size { 0 };
-    uint16_t* data { nullptr; };
-    ProbTable(){}
-    ProbTable(std::size_t sz){
-        size = sz;
-        data = new uint8_t[sz];
-        for (size_t i = 0; i < sz; i++){ data[i] = ((1 << bNumBitModelTotalBits) / 2); }
-    }
-    ~ProbTable(){
-        delete[] data;
+    uint16_t data[size] = { 0 };
+    ProbTable(){
+        for (size_t i = 0; i < size; i++){ data[i] = ((1 << numBits) / 2); }
     }
 };
 
-struct LZMAState {
-    uint64_t decompressedSize { 0 };
-    uint32_t range { 0xFFFFFFFF }, code { 0 }, dictSize { 0 };
-    uint8_t literalContextBits { 0 }, literalPositionBits { 0 }, numPosBits { 0 };
+template<uint32_t totalModelBits, uint32_t numMoveBits>
+struct RangeCoder {
+    uint8_t* streamPtr { nullptr };
+    std::size_t streamSize { 0 };
+    uint32_t range { 0xFFFFFFFF }, code { 0 };
     uint8_t corrupted { false };
+
+    void Normalize(){
+        if(range < (1 << 24)){
+            range <<= 8;
+            code = (code << 8) | *streamPtr;
+            streamPtr++;
+        }
+    }
+
+    uint32_t DecodeDirect(uint8_t* in, uint16_t numBits){
+        uint32_t data { 0 };
+
+        do {
+            range >>= 1;
+            code -= range;
+            
+            uint16_t t = 0 - (code >> 31);
+            code += range & t;
+
+            if(code == range){
+                corrupted = true;
+            }
+
+            Normalize();
+
+            data <<= 1;
+            data += t + 1;
+
+        } while(--numBits);
+
+        return data;
+    }
+
+    uint16_t DecodeBit(uint16_t* probablity){
+        uint32_t value = static_cast<uint32_t>(*probablity);
+        uint32_t bound = (range >> totalModelBits) * value;
+        uint16_t symbol { 0 };
+        if(code < bound){
+            value += ((1 << totalModelBits) - value) >> numMoveBits;
+            range = bound;
+            symbol = 0;
+        } else {
+            value -= value >> numMoveBits;
+            code -= bound;
+            range -= bound;
+            symbol = 1;
+        }
+        *probablity = static_cast<uint16_t>(value);
+        Normalize();
+        return symbol;
+    }
+
+    template<uint32_t bits, uint32_t size>
+    uint16_t DecodeBitTree(uint8_t* in, uint16_t numBits, ProbTable<bits, size>& table){
+        uint16_t m = 1;
+        for (uint16_t i = 0; i < numBits; i++) {
+            m = (m << 1) + DecodeBit(&table.data[m]);
+        }
+        return m - ((uint16_t)1 << numBits);
+    }
+
+    template<uint32_t bits, uint32_t size>
+    uint16_t DecodeBitTreeReverse(uint8_t* in, uint16_t numBits, ProbTable<bits, size>& table){
+        uint16_t m = 1;
+        uint16_t symb = 0;
+        for (uint16_t i = 0; i < numBits; i++){
+            uint16_t b = DecodeBit(&table.data[m]);
+            m = (m << 1) + b;
+            symb |= b << i;
+        }
+        return symb;   
+    }
+
+    RangeCoder(uint8_t* stream, std::size_t size){
+        streamSize = size;
+        streamPtr = stream;
+
+        uint8_t b = *streamPtr;
+        streamPtr++;
+
+        for(std::size_t i = 0; i < 4; i++)
+            code = (code << 8) | *streamPtr;
+
+        if(b != 0 || code == range)
+            corrupted = true;
+
+    }
+
 };
 
-void Normalize(LZMAState& state, uint8_t* in, std::size_t inSize){
-    if(state.range < (1 << 24)){
-        state.range <<= 8;
-        state.code = (state.code << 8) | *in;
-        in++;
-    }
-}
-
-void DecodeDirect(LZMAState& state, uint8_t* in, std::size_t inSize, uint16_t numBits){
-    uint32_t data { 0 };
-
-    do {
-        state.range >>= 1;
-        state.code -= state.range;
-        
-        uint16_t t = 0 - (state.code >> 31);
-        state.code += state.range & t;
-
-        if(state.code == state.range){
-            state.corrupted = true;
+struct LiteralCoder {
+    uint16_t state { 0 };
+    ProbTable<11, 0x300>* literalProbabilities { nullptr };
+    
+    void DecodeLiteral(uint8_t* outBuffer, std::size_t outSize, uint32_t rep){
+        uint16_t prevByte = 0;
+    
+        if(outSize != 0){
+            prevByte = *(outBuffer-1); // not sure if this is entirely right
         }
-
-        Normalize(state, in, inSize);
-
-        data <<= 1;
-        data += t + 1;
-
-    } while(--numBits);
-
-    return data;
-}
-
-uint16_t DecodeBit(LZMAState& state, uint8_t* in, std::size_t inSize, uint16_t* probablity){
-    uint16_t value = *probablity;
-    uint32_t bound = (state.range >> bNumBitModelTotalBits) * value;
-    uint16_t symbol { 0 };
-    if(state.code < bound){
-        value += ((1 << bNumBitModelTotalBits) - value) >> bNumMoveBits;
-        state.range = bound;
-        symbol = 0;
-    } else {
-        value -= value >> bNumMoveBits;
-        state.code -= bound;
-        state.range -= bound;
-        symbol = 1;
-    }
-    *probablity = value;
-    Normalize(state, in, inSize);
-    return symbol;
-}
-
-uint16_t DecodeBitTree(LZMAState& state, uint8_t* in, std::size_t inSize, uint16_t numBits, uint16_t* probablityTable){
-    uint16_t m = 1;
-    for (uint16_t i = 0; i < numBits; i++) {
-        m = (m << 1) + DecodeBit(&probablityTable[m]);
-    }
-    return m - ((uint16_t)1 << numBits);
-}
-
-uint16_t DecodeBitTreeReverse(LZMAState& state, uint8_t* in, std::size_t inSize, uint16_t numBits, uint16_t* probablityTable){
-    uint16_t m = 1;
-    uint16_t symb = 0;
-    for (uint16_t i = 0; i < numBits; i++){
-        uint16_t b = DecodeBit(state, in, inSize, &probablityTable[m]);
-        m <<= 1;
-        m += b;
-        symb |= bit << i;
-    }
-    return symb;
     
-}
+    }
 
-bool LZMADecodeStream(uint8_t* in, std::size_t inSize, std::size_t* out, uint8_t& outSize){
+    LiteralCoder(int count){
+        literalProbabilities = new ProbTable<11, 0x300>[count];
+    }
+
+    ~LiteralCoder(){
+        delete[] literalProbabilities;
+    }
+};
+
+struct LZMADecoderInfo {
+    uint64_t decompressedSize { 0 };
+    uint32_t dictSize { 1 << 12 };
+    uint8_t literalContextBits { 0 }, literalPositionBits { 0 }, numPosBits { 0 };
+
+    void InitProps(uint8_t* in){
+        uint8_t props = *in; in++;
+        literalContextBits = props % 9; props /= 9;
+        numPosBits = props / 5;
+        literalPositionBits = props % 5;
+        for (std::size_t i = 0; i < sizeof(uint32_t); i++){ dictSize |= static_cast<uint32_t>(*in) << (8 * i); in++; }
+        dictSize = std::max(static_cast<uint32_t>(1<<12), dictSize);
+
+        decompressedSize = *reinterpret_cast<uint64_t*>(in);
+    }
+
+};
+
+bool LZMADecompress(uint8_t* in, std::size_t inSize, uint8_t* out, std::size_t& outSize){    
     uint8_t* reader = in;
-    
-    LZMAState decoderState;
+
+    LZMADecoderInfo decoder;
+    RangeCoder<11, 5> rangeCoder(in, inSize);
+    LiteralCoder literals(decoder.literalPositionBits + decoder.literalContextBits);
 
     // Decode Stream Header
-    uint8_t properties = *reader; reader++;
+    decoder.InitProps(in);
+    reader += 5; // skip past 
 
-    decoderState.numPosBits = properties / (9 * 5);
-    properties -= decoderState.numPosBits * 9 * 5;
-    decoderState.literalPositionBits = properties / 9;
-    decoderState.literalContextBits = properties - decoderState.literalPositionBits * 9;
-
-    decoderState.dictSize = reinterpret_cast<uint32_t>(*reader); reader += sizeof(uint32_t);
-    decoderState.decompressedSize = reinterpret_cast<uint64_t>(*reader); reader += sizeof(uint64_t); // if this is u64 max size is not specified and it looks for an end marker
-
-    uint8_t b = *reader; reader++;
-    decoderState.code = reinterpret_cast<uint32_t>(*reader); reader += sizeof(uint32_t); // we can just read the first 4 bytes as is, no need for shifting
-
-    if(b != 0 || decoderState.code == decoderState.range){
-        decoderState.corrupted = true;
-    }
-
-    ProbTable bProbablityTables((uint32_t)0x300 << (uint32_t)(decoderState.literalContextBits + decoderState.literalPositionBits));
-
-    if(decoderState.code > decoderState.range){
-        decoderState.corrupted = true;
-    }
-    
-
-    return decoderState.corrupted;
+    return rangeCoder.corrupted;
 }
 #endif
 
