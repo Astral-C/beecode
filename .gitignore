@@ -1,4 +1,4 @@
 .vscode
 test.txt
 test.lzma
-test/test
+tests/test
